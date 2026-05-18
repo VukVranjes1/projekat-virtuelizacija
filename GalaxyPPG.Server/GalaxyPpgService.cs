@@ -6,20 +6,6 @@ using GalaxyPPG.Common;
 
 namespace GalaxyPPG.Server
 {
-    /// <summary>
-    /// Implementacija WCF servisa.
-    ///
-    /// InstanceContextMode.PerSession: svaka klijentska sesija dobija svoju
-    /// instancu - per-session resursi (RejectsWriter, SessionFileWriter,
-    /// session meta) drže se u poljima instance.
-    ///
-    /// KT2 zadatak 6: pri StartSession kreiramo strukturu
-    ///   Data/&lt;ParticipantId&gt;/E4/&lt;YYYY-MM-DD&gt;/session.csv  (validni redovi)
-    ///   Data/&lt;ParticipantId&gt;/E4/&lt;YYYY-MM-DD&gt;/rejects.csv  (nevalidni)
-    ///
-    /// KT2 zadatak 7: server prikazuje "prenos u toku" status periodično,
-    /// i "prenos završen" na EndSession (ili dispose).
-    /// </summary>
     [ServiceBehavior(
         InstanceContextMode = InstanceContextMode.PerSession,
         ConcurrencyMode = ConcurrencyMode.Single,
@@ -29,16 +15,16 @@ namespace GalaxyPPG.Server
         private SessionMeta _meta;
         private SessionFileWriter _session;
         private RejectsWriter _rejects;
+        private WarningLogWriter _warningLog;
+        private AnalyticsEngine _analytics;
+        private ConsoleEventListener _consoleListener;
         private string _sessionId;
         private long _validCount;
         private long _rejectCount;
         private bool _disposed;
         private bool _transferStartedAnnounced;
 
-        // Bazni direktorijum - dalje formira Data/<P>/E4/<YYYY-MM-DD>/.
         private readonly string _baseDataDir;
-
-        // Koliko redova proći pre nego što server izbaci progress poruku.
         private const int ProgressEveryN = 500;
 
         public GalaxyPpgService()
@@ -55,108 +41,67 @@ namespace GalaxyPPG.Server
         public string StartSession(SessionMeta meta)
         {
             if (meta == null)
-            {
                 throw new FaultException<ValidationFault>(
-                    new ValidationFault
-                    {
-                        Code = "INVALID_META",
-                        Message = "SessionMeta is null.",
-                        Field = nameof(SessionMeta)
-                    },
+                    new ValidationFault { Code = "INVALID_META", Message = "SessionMeta is null.", Field = nameof(SessionMeta) },
                     new FaultReason("Invalid session meta."));
-            }
 
             if (string.IsNullOrWhiteSpace(meta.ParticipantId))
-            {
                 throw new FaultException<ValidationFault>(
-                    new ValidationFault
-                    {
-                        Code = "INVALID_PARTICIPANT",
-                        Message = "ParticipantId is required.",
-                        Field = nameof(SessionMeta.ParticipantId)
-                    },
+                    new ValidationFault { Code = "INVALID_PARTICIPANT", Message = "ParticipantId is required.", Field = nameof(SessionMeta.ParticipantId) },
                     new FaultReason("ParticipantId is required."));
-            }
 
             _meta = meta;
             _sessionId = Guid.NewGuid().ToString("N");
 
-            // KT2 zadatak 6: Data/<P>/E4/<YYYY-MM-DD>/{session,rejects}.csv
-            //
-            // Datum biramo iz meta.StartTimestampUnix kada je validan, inače UTC danas.
-            // Ovo omogućava da reprodukovani snimak (sa starim timestamp-ovima) završi
-            // u "ispravnoj" YYYY-MM-DD direktorijumu, a ne u trenutnom.
             DateTime sessionDate = (meta.StartTimestampUnix > 0)
                 ? DateTimeOffset.FromUnixTimeMilliseconds((long)(meta.StartTimestampUnix * 1000)).UtcDateTime
                 : DateTime.UtcNow;
 
-            var sessionDir = Path.Combine(
-                _baseDataDir,
-                meta.ParticipantId,
-                "E4",
-                sessionDate.ToString("yyyy-MM-dd"));
-
+            var sessionDir = Path.Combine(_baseDataDir, meta.ParticipantId, "E4", sessionDate.ToString("yyyy-MM-dd"));
             Directory.CreateDirectory(sessionDir);
 
             _session = new SessionFileWriter(Path.Combine(sessionDir, "session.csv"));
             _rejects = new RejectsWriter(Path.Combine(sessionDir, "rejects.csv"));
+            _warningLog = new WarningLogWriter(Path.Combine(sessionDir, "warnings.csv"));
 
-            Console.WriteLine($"[Service] StartSession id={_sessionId} participant={meta.ParticipantId} " +
-                              $"device={meta.DeviceId} rateHz={meta.SampleRateHz}");
+            _analytics = AnalyticsEngine.FromConfig();
+            _consoleListener = new ConsoleEventListener();
+            _consoleListener.Subscribe(_analytics);
+            _warningLog.Subscribe(_analytics);
+
+            Console.WriteLine($"[Service] StartSession id={_sessionId} participant={meta.ParticipantId} device={meta.DeviceId} rateHz={meta.SampleRateHz}");
             Console.WriteLine($"[Service]   -> {sessionDir}");
+            Console.WriteLine($"[Service]   thresholds: BvpSpike={_analytics.BvpSpikeThreshold}, SkinTemp=[{_analytics.SkinTempMinC},{_analytics.SkinTempMaxC}], AccMotion={_analytics.AccMotionThreshold}");
 
+            _analytics.RaiseTransferStarted(_sessionId, meta.ParticipantId);
             return _sessionId;
         }
 
         public AckResult PushSample(E4Sample sample)
         {
             if (_meta == null)
-            {
                 throw new FaultException<ValidationFault>(
-                    new ValidationFault
-                    {
-                        Code = "NO_ACTIVE_SESSION",
-                        Message = "Call StartSession before PushSample.",
-                        Field = null
-                    },
+                    new ValidationFault { Code = "NO_ACTIVE_SESSION", Message = "Call StartSession before PushSample.", Field = null },
                     new FaultReason("No active session."));
-            }
 
             if (sample == null)
-            {
                 throw new FaultException<ValidationFault>(
-                    new ValidationFault
-                    {
-                        Code = "NULL_SAMPLE",
-                        Message = "Sample is null.",
-                        Field = null
-                    },
+                    new ValidationFault { Code = "NULL_SAMPLE", Message = "Sample is null.", Field = null },
                     new FaultReason("Sample is null."));
-            }
 
-            // KT2 zadatak 7: kad stigne prvi uzorak prijavimo "prenos u toku"
-            // (samo jednom po sesiji), pa onda dalje izveštavamo na svakih N redova.
             if (!_transferStartedAnnounced)
             {
                 Console.WriteLine($"[Service] Prenos u toku (session {_sessionId})...");
                 _transferStartedAnnounced = true;
             }
 
-            // Provera učesnika - mora da se poklapa sa sesijom.
+            _analytics?.ProcessSample(sample);
+
             if (!string.Equals(sample.ParticipantId, _meta.ParticipantId, StringComparison.Ordinal))
             {
-                Reject(sample, "PARTICIPANT_MISMATCH",
-                    $"Expected {_meta.ParticipantId}, got {sample.ParticipantId}",
-                    nameof(E4Sample.ParticipantId));
-
+                Reject(sample, "PARTICIPANT_MISMATCH", $"Expected {_meta.ParticipantId}, got {sample.ParticipantId}", nameof(E4Sample.ParticipantId));
                 throw new FaultException<ValidationFault>(
-                    new ValidationFault
-                    {
-                        Code = "PARTICIPANT_MISMATCH",
-                        Message = "Sample participant does not match session participant.",
-                        Field = nameof(E4Sample.ParticipantId),
-                        RowIndex = sample.RowIndex
-                    },
+                    new ValidationFault { Code = "PARTICIPANT_MISMATCH", Message = "Sample participant does not match session participant.", Field = nameof(E4Sample.ParticipantId), RowIndex = sample.RowIndex },
                     new FaultReason("Participant mismatch."));
             }
 
@@ -164,63 +109,41 @@ namespace GalaxyPPG.Server
             if (!result.IsValid)
             {
                 Reject(sample, result.Code, result.Message, result.Field);
-
                 throw new FaultException<ValidationFault>(
-                    new ValidationFault
-                    {
-                        Code = result.Code,
-                        Message = result.Message,
-                        Field = result.Field,
-                        RowIndex = sample.RowIndex
-                    },
+                    new ValidationFault { Code = result.Code, Message = result.Message, Field = result.Field, RowIndex = sample.RowIndex },
                     new FaultReason(result.Message));
             }
 
-            // KT2 zadatak 6: validan red ide u session.csv (append).
             _session?.Append(sample);
 
             var newCount = Interlocked.Increment(ref _validCount);
             if (newCount % ProgressEveryN == 0)
-            {
-                Console.WriteLine($"[Service] Prenos u toku - primljeno {newCount} validnih " +
-                                  $"({Interlocked.Read(ref _rejectCount)} rejected)");
-            }
+                Console.WriteLine($"[Service] Prenos u toku - primljeno {newCount} validnih ({Interlocked.Read(ref _rejectCount)} rejected)");
 
-            return new AckResult
-            {
-                Accepted = true,
-                Status = "OK",
-                RowIndex = sample.RowIndex
-            };
+            return new AckResult { Accepted = true, Status = "OK", RowIndex = sample.RowIndex };
         }
 
         public void EndSession()
         {
-            Console.WriteLine($"[Service] Prenos završen. id={_sessionId} " +
-                              $"valid={_validCount} rejects={_rejectCount}");
+            Console.WriteLine($"[Service] Prenos zavrsen. id={_sessionId} valid={_validCount} rejects={_rejectCount}");
 
-            // Putanje pre Dispose-a (kad se _session i _rejects null-iraju).
+            _analytics?.RaiseTransferCompleted(_sessionId, _meta?.ParticipantId, _validCount);
+
             var sessionPath = _session?.FilePath;
             var rejectsPath = _rejects?.FilePath;
+            var warningsPath = _warningLog?.FilePath;
 
             Dispose();
 
             if (rejectsPath != null)
-            {
-                var rejectRows = CountRejectRows(rejectsPath);
-                Console.WriteLine($"[Service]   rejects.csv: {rejectRows} row(s)");
-            }
+                Console.WriteLine($"[Service]   rejects.csv: {CountRows(rejectsPath)} row(s)");
+            if (warningsPath != null && File.Exists(warningsPath))
+                Console.WriteLine($"[Service]   warnings.csv: {CountRows(warningsPath)} row(s)");
             if (sessionPath != null && File.Exists(sessionPath))
-            {
                 Console.WriteLine($"[Service]   session.csv: {new FileInfo(sessionPath).Length} bytes");
-            }
         }
 
-        /// <summary>
-        /// StreamReader + FileStream u using blokovima - eksplicitan primer
-        /// pravilnog Dispose-a (KT1 zadatak 4).
-        /// </summary>
-        private static int CountRejectRows(string path)
+        private static int CountRows(string path)
         {
             if (!File.Exists(path)) return 0;
 
@@ -230,40 +153,39 @@ namespace GalaxyPPG.Server
             {
                 while (sr.ReadLine() != null) totalLines++;
             }
-            return totalLines > 0 ? totalLines - 1 : 0; // -1 za zaglavlje
+            return totalLines > 0 ? totalLines - 1 : 0;
         }
-
-        // ---- Pomoćne metode ----
 
         private void Reject(E4Sample sample, string code, string message, string field)
         {
             Interlocked.Increment(ref _rejectCount);
-            _rejects?.WriteReject(
-                sample.ParticipantId,
-                sample.RowIndex,
-                code,
-                field,
-                message,
-                SerializeRaw(sample));
+            _rejects?.WriteReject(sample.ParticipantId, sample.RowIndex, code, field, message, SerializeRaw(sample));
         }
 
         private static string SerializeRaw(E4Sample s)
         {
-            return $"ts={s.TimestampUnix};bvp={s.BVP};acc=({s.AccX},{s.AccY},{s.AccZ});" +
-                   $"hr={s.HeartRate};ibi={s.IBI_ms};temp={s.SkinTemp}";
+            return $"ts={s.TimestampUnix};bvp={s.BVP};acc=({s.AccX},{s.AccY},{s.AccZ});hr={s.HeartRate};ibi={s.IBI_ms};temp={s.SkinTemp}";
         }
-
-        // ---- Dispose ----
 
         public void Dispose()
         {
             if (_disposed) return;
 
-            try { _session?.Dispose(); } catch { /* tiho */ }
-            try { _rejects?.Dispose(); } catch { /* tiho */ }
+            if (_analytics != null)
+            {
+                try { _consoleListener?.Unsubscribe(_analytics); } catch { }
+                try { _warningLog?.Unsubscribe(_analytics); } catch { }
+            }
 
+            try { _warningLog?.Dispose(); } catch { }
+            try { _session?.Dispose(); } catch { }
+            try { _rejects?.Dispose(); } catch { }
+
+            _warningLog = null;
             _session = null;
             _rejects = null;
+            _analytics = null;
+            _consoleListener = null;
             _disposed = true;
 
             GC.SuppressFinalize(this);
